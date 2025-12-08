@@ -1,6 +1,8 @@
-import React, { useState, useCallback } from 'react';
+
+import React, { useState, useCallback, useEffect } from 'react';
 import { BookCover } from './components/BookCover';
-import { MonthPage } from './components/MonthPage';
+import { MaximArtPage } from './components/MaximArtPage';
+import { CalendarGridPage } from './components/CalendarGridPage';
 import { FrontCoverPage } from './components/FrontCoverPage';
 import { BackCoverPage } from './components/BackCoverPage';
 import { Navigation } from './components/Navigation';
@@ -16,6 +18,9 @@ const App: React.FC = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
 
+  // Queue to manage sequential image generation
+  const [generationQueue, setGenerationQueue] = useState<number[]>([]);
+
   const handleStart = useCallback(async () => {
     setIsLoading(true);
     try {
@@ -25,6 +30,9 @@ const App: React.FC = () => {
       if (result.maxims.length > 0) {
         setAppState('calendar');
         setCurrentIndex(0); // Start at Front Cover
+        
+        // Populate queue with all maxim IDs to trigger sequential background generation
+        setGenerationQueue(result.maxims.map(m => m.id));
       } else {
         throw new Error("No maxims found.");
       }
@@ -38,10 +46,9 @@ const App: React.FC = () => {
   }, []);
 
   const handleGenerateImage = useCallback(async (targetMaxim: Maxim) => {
-    // Prevent multiple calls for same maxim if already loading or if image exists
+    // Prevent multiple calls
     if (targetMaxim.imageUrl || targetMaxim.imageLoading) return;
 
-    // Optimistically update loading state
     setMaxims(prev => prev.map(m => m.id === targetMaxim.id ? { ...m, imageLoading: true, imageFailed: false } : m));
 
     const imageUrl = await generateMaximIllustration(targetMaxim);
@@ -53,7 +60,6 @@ const App: React.FC = () => {
           : m
       ));
     } else {
-      // Handle failure: Stop loading, mark as failed, do NOT keep url empty (which would trigger useEffect loop)
       setMaxims(prev => prev.map(m => 
         m.id === targetMaxim.id 
           ? { ...m, imageLoading: false, imageFailed: true } 
@@ -62,8 +68,38 @@ const App: React.FC = () => {
     }
   }, []);
 
-  // Total pages = 1 (Front) + Maxims + 1 (Back)
-  const totalPages = maxims.length > 0 ? maxims.length + 2 : 0;
+  // Background generator for Print Mode readiness
+  useEffect(() => {
+    const processQueue = async () => {
+       if (generationQueue.length === 0) return;
+       
+       const nextId = generationQueue[0];
+       const maxim = maxims.find(m => m.id === nextId);
+
+       if (maxim && !maxim.imageUrl && !maxim.imageLoading && !maxim.imageFailed) {
+          await handleGenerateImage(maxim);
+       }
+
+       // Remove from queue regardless of success to move to next
+       setGenerationQueue(prev => prev.slice(1));
+    };
+
+    if (generationQueue.length > 0) {
+       // Small delay to allow React state updates to settle and avoid slamming API
+       const timer = setTimeout(processQueue, 1000);
+       return () => clearTimeout(timer);
+    }
+  }, [generationQueue, maxims, handleGenerateImage]);
+
+  // Logic to determine Total Pages and Current View
+  // Pages: Front Cover (1) + 12 Months * 2 (Art + Grid) + Back Cover (1) = 2 + 24 = 26 pages
+  // Index 0: Front Cover
+  // Index 1: Month 1 Art
+  // Index 2: Month 1 Grid
+  // ...
+  // Index 25: Back Cover
+
+  const totalPages = maxims.length > 0 ? (maxims.length * 2) + 2 : 0;
 
   const goToNext = () => {
     if (currentIndex < totalPages - 1) setCurrentIndex(c => c + 1);
@@ -74,10 +110,37 @@ const App: React.FC = () => {
   };
 
   const handlePrint = () => {
-    // Add a delay to ensure the UI handles the click event fully before opening the print dialog
     setTimeout(() => {
       window.print();
     }, 100);
+  };
+
+  // Helper to get maxim based on page index
+  const getCurrentPageContent = () => {
+    if (currentIndex === 0) return <FrontCoverPage />;
+    if (currentIndex === totalPages - 1) return <BackCoverPage />;
+
+    const adjustedIndex = currentIndex - 1; // 0 to 23
+    const monthIndex = Math.floor(adjustedIndex / 2);
+    const isArtPage = adjustedIndex % 2 === 0;
+    const maxim = maxims[monthIndex];
+
+    if (!maxim) return <div>Loading...</div>;
+
+    if (isArtPage) {
+      return (
+        <MaximArtPage 
+          maxim={maxim} 
+          onGenerateImage={handleGenerateImage} 
+        />
+      );
+    } else {
+      return (
+        <CalendarGridPage 
+          maxim={maxim} 
+        />
+      );
+    }
   };
 
   if (appState === 'error') {
@@ -107,19 +170,38 @@ const App: React.FC = () => {
          <GroundingSources chunks={groundingChunks} />
       </div>
       
-      <main className="flex-1 w-full h-full relative overflow-hidden">
-        {currentIndex === 0 && <FrontCoverPage />}
-        
-        {currentIndex > 0 && currentIndex <= maxims.length && maxims[currentIndex - 1] && (
-          <MonthPage 
-            key={maxims[currentIndex - 1].id} 
-            maxim={maxims[currentIndex - 1]} 
-            onGenerateImage={handleGenerateImage}
-          />
-        )}
-
-        {currentIndex === totalPages - 1 && <BackCoverPage />}
+      {/* SCREEN VIEW */}
+      <main className="flex-1 w-full h-full relative overflow-hidden no-print">
+        {getCurrentPageContent()}
       </main>
+
+      {/* PRINT VIEW (Hidden on Screen, Visible on Print) */}
+      <div className="hidden print:block w-full">
+         <FrontCoverPage />
+         <div className="break-after-page"></div>
+         
+         {maxims.map((maxim) => (
+             <React.Fragment key={maxim.id}>
+                {/* Page 1: Art + Maxim */}
+                <div className="w-full h-screen break-after-page print:h-[100vh] overflow-hidden">
+                   <MaximArtPage 
+                     maxim={maxim} 
+                     onGenerateImage={handleGenerateImage}
+                     className="h-full"
+                   />
+                </div>
+                {/* Page 2: Grid */}
+                <div className="w-full h-screen break-after-page print:h-[100vh] overflow-hidden">
+                   <CalendarGridPage 
+                     maxim={maxim}
+                     className="h-full"
+                   />
+                </div>
+             </React.Fragment>
+         ))}
+         
+         <BackCoverPage />
+      </div>
 
       <Navigation 
         currentIndex={currentIndex} 
